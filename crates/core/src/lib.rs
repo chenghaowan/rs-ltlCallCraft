@@ -9,6 +9,7 @@
 //! - [`util`]:配色/图片判断/时间/目录工具
 
 pub mod api;
+pub mod casdoor;
 pub mod error;
 pub mod node;
 pub mod store;

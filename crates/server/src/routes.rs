@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Multipart, Path as AxPath, Query, State};
+use axum::extract::{Multipart, OriginalUri, Path as AxPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -14,18 +14,22 @@ use serde_json::json;
 
 use ltl_chat_core::api::TokenResponse;
 use ltl_chat_core::iroh_gossip::proto::TopicId;
-use ltl_chat_core::types::{
-    AttachmentMeta, ConvType, Conversation, User, UserId,
-};
+use ltl_chat_core::types::{AttachmentMeta, ConvType, Conversation, User, UserId};
 
+use crate::config::AuthMode;
 use crate::db::UserRow;
-use crate::state::{AppState, ONLINE_WINDOW_MS};
+use crate::state::{AppState, OAuthSlot, ONLINE_WINDOW_MS};
 use crate::now_ms;
 
 pub fn router(st: Arc<AppState>) -> Router {
     Router::new()
+        .route("/api/v1/auth/meta", get(auth_meta))
         .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/login/local", post(auth_login_local))
         .route("/api/v1/auth/phone/login", post(auth_phone_login))
+        .route("/api/v1/auth/oauth-url", get(auth_oauth_url))
+        .route("/api/v1/auth/callback", get(auth_oauth_callback))
+        .route("/api/v1/auth/poll", get(auth_oauth_poll))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/refresh", post(auth_refresh))
         .route("/api/v1/users", get(users_list))
@@ -113,15 +117,23 @@ fn current_user(st: &AppState, headers: &HeaderMap) -> Result<UserRow, ApiError>
 }
 
 // ---------------------------------------------------------------------------
-// 登录 / 登记
+// 登录 / 登记(四态: ym | casdoor | local | token)
 // ---------------------------------------------------------------------------
+
+/// 服务器认证能力(无需登录;GUI/CLI 据此渲染登录表单)
+async fn auth_meta(State(st): State<Arc<AppState>>) -> ApiResult<serde_json::Value> {
+    Ok(Json(serde_json::json!({
+        "mode": st.auth.mode.as_str(),
+        "demo": st.auth.demo_enabled(),
+    })))
+}
 
 #[derive(Deserialize)]
 struct LoginBody {
     ym_auth_token: String,
 }
 
-/// 演示分支(对齐旧系统):`demo_` 前缀 token 不走 YM Auth
+/// 演示分支(对齐旧系统):`demo_` 前缀 token 不走任何外部 IdP
 fn demo_user_info(token: &str) -> ltl_chat_core::ym::YmUserInfo {
     let suffix: String = token.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
     ltl_chat_core::ym::YmUserInfo {
@@ -130,6 +142,16 @@ fn demo_user_info(token: &str) -> ltl_chat_core::ym::YmUserInfo {
         email: Some(format!("demo{suffix}@example.com")),
         avatar: None,
     }
+}
+
+/// token 模式:由 token 确定性派生 ymid(不向其他用户泄露 token 本身)
+fn token_ymid(token: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in token.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("tok_{h:016x}")
 }
 
 async fn issue_token(
@@ -158,20 +180,227 @@ async fn issue_token(
 
 async fn auth_login(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> ApiResult<TokenResponse> {
-    let (info, ym_refresh): (ltl_chat_core::ym::YmUserInfo, Option<String>) =
-        if body.ym_auth_token.starts_with("demo_") {
-            (demo_user_info(&body.ym_auth_token), None)
-        } else {
-            let Some(info) = st.ym.validate_token(&body.ym_auth_token).await else {
+    let token = body.ym_auth_token.trim();
+    // 演示 token 在所有模式可用(受 demo 开关控制)
+    if token.starts_with("demo_") {
+        if !st.auth.demo_enabled() {
+            return Err(ApiError::unauthorized("演示登录已关闭"));
+        }
+        let resp = issue_token(&st, demo_user_info(token), None, None).await?;
+        spawn_roster_sync(&st);
+        return Ok(Json(resp));
+    }
+    match st.auth.mode {
+        AuthMode::Ym => {
+            let ym = st.ym.as_ref().expect("ym client");
+            let Some(info) = ym.validate_token(token).await else {
                 return Err(ApiError::unauthorized("YM Auth 校验失败"));
             };
-            (info, None)
-        };
-    let resp = issue_token(&st, info, Some(&body.ym_auth_token), ym_refresh.as_deref()).await?;
-    spawn_roster_sync(&st);
+            let resp = issue_token(&st, info, Some(token), None).await?;
+            spawn_roster_sync(&st);
+            Ok(Json(resp))
+        }
+        AuthMode::Casdoor => {
+            let casdoor = st.casdoor.as_ref().expect("casdoor client");
+            let Some(info) = casdoor.validate_token(token).await else {
+                return Err(ApiError::unauthorized("Casdoor 校验失败"));
+            };
+            let resp = issue_token(&st, info, None, None).await?;
+            Ok(Json(resp))
+        }
+        AuthMode::Token => {
+            let Some(display_name) = st.auth.tokens.get(token).cloned() else {
+                return Err(ApiError::unauthorized("token 无效"));
+            };
+            let info = ltl_chat_core::ym::YmUserInfo {
+                ymid: token_ymid(token),
+                name: display_name,
+                email: None,
+                avatar: None,
+            };
+            let resp = issue_token(&st, info, None, None).await?;
+            Ok(Json(resp))
+        }
+        AuthMode::Local => Err(ApiError::bad_request(
+            "本服务器为内置账号模式, 请用 POST /api/v1/auth/login/local",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct LocalLoginBody {
+    username: String,
+    password: String,
+}
+
+/// 内置账号登录(argon2 校验 config.toml [auth.users])
+async fn auth_login_local(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<LocalLoginBody>,
+) -> ApiResult<TokenResponse> {
+    if st.auth.mode != AuthMode::Local {
+        return Err(ApiError::bad_request("本服务器未启用内置账号模式"));
+    }
+    let username = body.username.trim();
+    let Some(stored_hash) = st.auth.users.get(username) else {
+        return Err(ApiError::unauthorized("用户名或密码错误"));
+    };
+    let verify = || -> bool {
+        use argon2::password_hash::PasswordVerifier;
+        use argon2::Argon2;
+        match argon2::password_hash::PasswordHash::new(stored_hash) {
+            Ok(parsed) => Argon2::default().verify_password(body.password.as_bytes(), &parsed).is_ok(),
+            Err(_) => false,
+        }
+    };
+    if !verify() {
+        return Err(ApiError::unauthorized("用户名或密码错误"));
+    }
+    let info = ltl_chat_core::ym::YmUserInfo {
+        ymid: username.to_string(),
+        name: username.to_string(),
+        email: None,
+        avatar: None,
+    };
+    let resp = issue_token(&st, info, None, None).await?;
     Ok(Json(resp))
+}
+
+// ---------------------------------------------------------------------------
+// OAuth 浏览器登录(casdoor 模式):授权页 → 回调换码 → 票据轮询
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct OAuthUrlQuery {
+    /// 备用:强制回调 host(如 --public-url), 缺省用请求 Host
+    #[serde(default)]
+    base: Option<String>,
+}
+
+/// 返回 {authorization_url, ticket, redirect_uri};GUI/CLI 打开浏览器后轮询 /poll
+async fn auth_oauth_url(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<OAuthUrlQuery>,
+    uri: axum::extract::OriginalUri,
+) -> ApiResult<ltl_chat_core::api::OAuthStartResponse> {
+    if st.auth.mode != AuthMode::Casdoor {
+        return Err(ApiError::bad_request("本服务器未启用 casdoor 模式"));
+    }
+    let (proto, host) = request_proto_host(&headers, uri);
+    let redirect_uri = match q.base {
+        Some(b) => format!("{}/api/v1/auth/callback", b.trim_end_matches('/')),
+        None => ltl_chat_core::casdoor::CasdoorClient::callback_uri(&proto, &host),
+    };
+    let ticket = uuid::Uuid::new_v4().simple().to_string();
+    let casdoor = st.casdoor.as_ref().expect("casdoor client");
+    let authorization_url = casdoor.authorize_url(&redirect_uri, &ticket);
+    st.oauth.lock().unwrap().insert(
+        ticket.clone(),
+        OAuthSlot::Pending { state: ticket.clone(), at: Instant::now() },
+    );
+    Ok(Json(ltl_chat_core::api::OAuthStartResponse {
+        authorization_url,
+        ticket,
+        redirect_uri,
+    }))
+}
+
+fn request_proto_host(headers: &HeaderMap, uri: axum::extract::OriginalUri) -> (String, String) {
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http")
+        .to_string();
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            uri.host().map(|h| {
+                if let Some(port) = uri.port_u16() {
+                    format!("{h}:{port}")
+                } else {
+                    h.to_string()
+                }
+            })
+        })
+        .unwrap_or_else(|| "127.0.0.1:8901".to_string());
+    (proto, host)
+}
+
+/// Casdoor 回调:换 token + userinfo → 发自家 JWT → 存进票据槽, 回一个简单成功页
+async fn auth_oauth_callback(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    uri: axum::extract::OriginalUri,
+) -> Result<axum::response::Html<String>, ApiError> {
+    let code = q.get("code").cloned().unwrap_or_default();
+    let state = q.get("state").cloned().unwrap_or_default();
+    let err = |msg: &str| {
+        axum::response::Html(format!(
+            "<!DOCTYPE html><meta charset='utf-8'><body style=\"font-family:sans-serif;text-align:center;padding-top:15vh\"><h2>❌ 登录失败</h2><p style='color:#888'>{msg}</p></body>"
+        ))
+    };
+    if code.is_empty() || state.is_empty() {
+        return Err(ApiError::bad_request("缺少 code/state"));
+    }
+
+    let (proto, host) = request_proto_host(&headers, uri);
+    let redirect_uri = ltl_chat_core::casdoor::CasdoorClient::callback_uri(&proto, &host);
+
+    // 取出票据(防重放: 取走即删)
+    let slot = st.oauth.lock().unwrap().remove(&state);
+    let Some(OAuthSlot::Pending { state: expected, at }) = slot else {
+        return Ok(err("登录票据无效或已使用, 请回应用重新发起"));
+    };
+    if expected != state || at.elapsed() > crate::state::OAUTH_TICKET_TTL {
+        return Ok(err("登录票据已过期, 请回应用重新发起"));
+    }
+
+    let casdoor = st.casdoor.as_ref().expect("casdoor client");
+    let (_access_token, info) = casdoor
+        .exchange_code(&code, &redirect_uri)
+        .await
+        .map_err(ApiError::unauthorized)?;
+    let resp = issue_token(&st, info, None, None).await?;
+
+    st.oauth
+        .lock()
+        .unwrap()
+        .insert(state, OAuthSlot::Done { resp });
+    tracing::info!("OAuth 登录成功, 票据就绪");
+    Ok(axum::response::Html(
+        "<!DOCTYPE html><meta charset='utf-8'><body style=\"font-family:sans-serif;text-align:center;padding-top:15vh\"><h2>✅ 登录成功</h2><p style='color:#888'>请回到 ltl-chat 应用</p></body>".into(),
+    ))
+}
+
+/// GUI/CLI 每 2s 轮询:202 = 未完成,200 = TokenResponse,404 = 票据失效
+async fn auth_oauth_poll(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(ticket) = q.get("ticket") else {
+        return ApiError::bad_request("缺少 ticket").into_response();
+    };
+    let slot = {
+        let mut map = st.oauth.lock().unwrap();
+        // 顺带清理过期票据
+        map.retain(|_, s| match s {
+            OAuthSlot::Pending { at, .. } => at.elapsed() <= crate::state::OAUTH_TICKET_TTL,
+            OAuthSlot::Done { .. } => true,
+        });
+        map.get(ticket).cloned()
+    };
+    match slot {
+        Some(OAuthSlot::Done { resp }) => Json(resp).into_response(),
+        Some(OAuthSlot::Pending { .. }) => StatusCode::ACCEPTED.into_response(),
+        None => ApiError::not_found("票据不存在或已过期").into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -185,12 +414,17 @@ async fn auth_phone_login(
     State(st): State<Arc<AppState>>,
     Json(body): Json<PhoneLoginBody>,
 ) -> ApiResult<TokenResponse> {
+    if st.auth.mode != AuthMode::Ym {
+        return Err(ApiError::bad_request("本服务器未启用 YM Auth 手机号登录"));
+    }
     let (ym_access, ym_refresh) = st
         .ym
+        .as_ref()
+        .expect("ym client")
         .phone_login(&body.phone, body.username.as_deref())
         .await
         .map_err(ApiError::unauthorized)?;
-    let Some(info) = st.ym.validate_token(&ym_access).await else {
+    let Some(info) = st.ym.as_ref().expect("ym client").validate_token(&ym_access).await else {
         return Err(ApiError::unauthorized("YM Auth 校验失败"));
     };
     let resp =
@@ -231,8 +465,11 @@ async fn auth_refresh(
     }))
 }
 
-/// 节流的全员同步(60s 一次;demo 用户跳过)
+/// 节流的全员同步(60s 一次;仅 ym 模式有意义;demo 用户跳过)
 fn spawn_roster_sync(st: &Arc<AppState>) {
+    if st.auth.mode != AuthMode::Ym {
+        return;
+    }
     {
         let mut g = st.last_sync.lock().unwrap();
         if let Some(t) = *g {
@@ -254,7 +491,7 @@ fn spawn_roster_sync(st: &Arc<AppState>) {
             .find(|r| r.is_active && !r.ymid.starts_with("demo_"))
             .and_then(|r| r.ym_auth_token.clone());
         let Some(token) = token else { return };
-        let list = st.ym.users_list(&token).await;
+        let list = st.ym.as_ref().expect("ym client").users_list(&token).await;
         if list.is_empty() {
             return;
         }

@@ -44,91 +44,162 @@ impl LtlChatApp {
                                     ui.label(egui::RichText::new("ltl-chat · iroh P2P 通讯").size(12.0).color(TEXT_SUB));
                                     ui.add_space(18.0);
 
-                                    egui::Grid::new("login_grid")
-                                        .num_columns(2)
-                                        .spacing([8.0, 8.0])
-                                        .show(ui, |ui| {
-                                            ui.label("服务器");
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut self.login_server)
-                                                    .desired_width(240.0)
-                                                    .hint_text("http://127.0.0.1:8901"),
-                                            );
-                                            ui.end_row();
-                                            ui.label("手机号");
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut self.login_phone)
-                                                    .desired_width(240.0)
-                                                    .hint_text("YM Auth 注册手机号"),
-                                            );
-                                            ui.end_row();
-                                            ui.label("用户名");
-                                            ui.add(
-                                                egui::TextEdit::singleline(&mut self.login_username)
-                                                    .desired_width(240.0)
-                                                    .hint_text("新用户注册时必填"),
-                                            );
-                                            ui.end_row();
-                                        });
-                                    ui.add_space(10.0);
-                                    ui.allocate_ui_with_layout(
-                                        Vec2::new(ui.available_width(), 34.0),
-                                        Layout::top_down_justified(Align::Center),
-                                        |ui| {
-                                            let phone_btn = ui.add_sized(
-                                                [ui.available_width(), 32.0],
-                                                egui::Button::new(
-                                                    egui::RichText::new("手机号登录 / 注册").color(Color32::WHITE).size(15.0),
-                                                )
-                                                .fill(FEISHU_BLUE)
-                                                .corner_radius(6.0),
-                                            );
-                                            if phone_btn.clicked() && !self.login_busy {
-                                                self.login_busy = true;
-                                                let _ = self.cmd.send(Cmd::LoginByPhone {
-                                                    server: self.login_server.trim().to_string(),
-                                                    phone: self.login_phone.trim().to_string(),
-                                                    username: {
-                                                        let u = self.login_username.trim();
-                                                        if u.is_empty() { None } else { Some(u.to_string()) }
-                                                    },
-                                                });
-                                            }
-                                        },
-                                    );
-                                    ui.add_space(14.0);
-                                    ui.separator();
-                                    ui.add_space(10.0);
+                                    let (mode, demo) = self
+                                        .auth_meta
+                                        .clone()
+                                        .unwrap_or_else(|| ("ym".to_string(), true));
 
-                                    ui.label(egui::RichText::new("或粘贴 YM Auth Token 登录").size(12.0).color(TEXT_SUB));
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.login_token)
-                                            .desired_width(ui.available_width())
-                                            .password(true)
-                                            .hint_text("yimei2000.cn 的 access_token"),
-                                    );
-                                    ui.add_space(8.0);
-                                    let token_btn = ui.add_sized(
-                                        [ui.available_width(), 30.0],
-                                        egui::Button::new("Token 登录"),
-                                    );
-                                    if token_btn.clicked() && !self.login_busy {
-                                        self.login_busy = true;
-                                        let _ = self.cmd.send(Cmd::LoginByToken {
-                                            server: self.login_server.trim().to_string(),
-                                            token: self.login_token.trim().to_string(),
-                                        });
+                                    // ---- 主登录表单(按服务器 [auth] mode)----
+                                    if mode == "local" {
+                                        egui::Grid::new("login_grid")
+                                            .num_columns(2)
+                                            .spacing([8.0, 8.0])
+                                            .show(ui, |ui| {
+                                                ui.label("用户名");
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut self.login_username)
+                                                        .desired_width(240.0),
+                                                );
+                                                ui.end_row();
+                                                ui.label("密码");
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut self.login_password)
+                                                        .desired_width(240.0)
+                                                        .password(true),
+                                                );
+                                                ui.end_row();
+                                            });
+                                        ui.add_space(10.0);
+                                        let local_btn = ui.add_sized(
+                                            [ui.available_width(), 32.0],
+                                            egui::Button::new(
+                                                egui::RichText::new("登 录").color(Color32::WHITE).size(15.0),
+                                            )
+                                            .fill(FEISHU_BLUE)
+                                            .corner_radius(6.0),
+                                        );
+                                        if local_btn.clicked() && !self.login_busy {
+                                            self.login_busy = true;
+                                            let _ = self.cmd.send(Cmd::LoginLocal {
+                                                server: self.login_server.trim().to_string(),
+                                                username: self.login_username.trim().to_string(),
+                                                password: self.login_password.trim().to_string(),
+                                            });
+                                        }
+                                    } else if mode == "casdoor" {
+                                        ui.label(
+                                            egui::RichText::new("在浏览器完成登录:密码 / 邮箱验证码 / 短信 / 飞书扫码")
+                                                .size(12.0)
+                                                .color(TEXT_SUB),
+                                        );
+                                        ui.add_space(8.0);
+                                        let oauth_btn = ui.add_sized(
+                                            [ui.available_width(), 32.0],
+                                            egui::Button::new(
+                                                egui::RichText::new("打开浏览器登录").color(Color32::WHITE).size(15.0),
+                                            )
+                                            .fill(FEISHU_BLUE)
+                                            .corner_radius(6.0),
+                                        );
+                                        if oauth_btn.clicked() && !self.login_busy && !self.oauth_waiting {
+                                            self.login_busy = true;
+                                            let _ = self.cmd.send(Cmd::OAuthStart {
+                                                server: self.login_server.trim().to_string(),
+                                            });
+                                        }
+                                    } else if mode == "ym" {
+                                        egui::Grid::new("login_grid")
+                                            .num_columns(2)
+                                            .spacing([8.0, 8.0])
+                                            .show(ui, |ui| {
+                                                ui.label("手机号");
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut self.login_phone)
+                                                        .desired_width(240.0)
+                                                        .hint_text("YM Auth 注册手机号"),
+                                                );
+                                                ui.end_row();
+                                                ui.label("用户名");
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut self.login_username)
+                                                        .desired_width(240.0)
+                                                        .hint_text("新用户注册时必填"),
+                                                );
+                                                ui.end_row();
+                                            });
+                                        ui.add_space(10.0);
+                                        let phone_btn = ui.add_sized(
+                                            [ui.available_width(), 32.0],
+                                            egui::Button::new(
+                                                egui::RichText::new("手机号登录 / 注册").color(Color32::WHITE).size(15.0),
+                                            )
+                                            .fill(FEISHU_BLUE)
+                                            .corner_radius(6.0),
+                                        );
+                                        if phone_btn.clicked() && !self.login_busy {
+                                            self.login_busy = true;
+                                            let _ = self.cmd.send(Cmd::LoginByPhone {
+                                                server: self.login_server.trim().to_string(),
+                                                phone: self.login_phone.trim().to_string(),
+                                                username: {
+                                                    let u = self.login_username.trim();
+                                                    if u.is_empty() { None } else { Some(u.to_string()) }
+                                                },
+                                            });
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("该服务器使用 Token 登录, 请在下方粘贴").size(12.0).color(TEXT_SUB),
+                                        );
                                     }
-                                    ui.add_space(8.0);
-                                    let demo_btn = ui.add_sized(
-                                        [ui.available_width(), 30.0],
-                                        egui::Button::new("本地演示登录"),
-                                    );
-                                    if demo_btn.clicked() && !self.login_busy {
-                                        self.login_busy = true;
-                                        let _ = self.cmd.send(Cmd::LoginByToken {
-                                            server: self.login_server.trim().to_string(),
-                                            token: "demo_local_dev".into(),
+
+                                    // ---- Token 直登(备用, 非 local 模式)----
+                                    if mode != "local" {
+                                        ui.add_space(12.0);
+                                        ui.separator();
+                                        ui.add_space(8.0);
+                                        ui.label(egui::RichText::new("或粘贴访问 Token 登录").size(12.0).color(TEXT_SUB));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.login_token)
+                                                .desired_width(ui.available_width())
+                                                .password(true)
+                                                .hint_text("access_token"),
+                                        );
+                                        ui.add_space(8.0);
+                                        let token_btn = ui.add_sized(
+                                            [ui.available_width(), 30.0],
+                                            egui::Button::new("Token 登录"),
+                                        );
+                                        if token_btn.clicked() && !self.login_busy {
+                                            self.login_busy = true;
+                                            let _ = self.cmd.send(Cmd::LoginByToken {
+                                                server: self.login_server.trim().to_string(),
+                                                token: self.login_token.trim().to_string(),
+                                            });
+                                        }
+                                    }
+
+                                    // ---- 演示登录(服务器 demo 开关)----
+                                    if demo {
+                                        ui.add_space(8.0);
+                                        let demo_btn = ui.add_sized(
+                                            [ui.available_width(), 30.0],
+                                            egui::Button::new("本地演示登录"),
+                                        );
+                                        if demo_btn.clicked() && !self.login_busy {
+                                            self.login_busy = true;
+                                            let _ = self.cmd.send(Cmd::LoginByToken {
+                                                server: self.login_server.trim().to_string(),
+                                                token: "demo_local_dev".into(),
+                                            });
+                                        }
+                                    }
+
+                                    if self.oauth_waiting {
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            ui.add(egui::Spinner::new().size(16.0));
+                                            ui.label(egui::RichText::new("等待浏览器完成登录…").color(TEXT_SUB));
                                         });
                                     }
 

@@ -20,6 +20,7 @@ iroh-gossip = "0.102"
 # 局域网 mDNS 地址发现(同机/同网段不依赖 n0 公网 DNS)
 iroh-mdns-address-lookup = "0.6"
 rusqlite = { version = "0.37", features = ["bundled"] }
+argon2 = "0.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,6 +40,7 @@ eframe = "0.37"
 egui = "0.37"
 egui_extras = { version = "0.37", features = ["image"] }
 rfd = "0.17"
+open = "5"
 
 [profile.dev]
 # dev 也开一层优化:iroh/rusqlite/image 未优化时明显卡顿

@@ -1,6 +1,17 @@
 # rs-ltlCallCraft · ltl-chat(老头通讯)
 
-从 `ltl-manage` 拆出的独立通讯模块:服务器端对接 **YM Auth** 登记登录,聊天与群聊全部走 **iroh + iroh-gossip** P2P 网络,egui 复刻飞书界面。**ltl-manage 本体不改动。**
+从 `ltl-manage` 拆出的独立通讯模块:服务器端**可配置认证**(YM Auth / 自部署 Casdoor / 内置账号 / 静态令牌 四态切换),聊天与群聊全部走 **iroh + iroh-gossip** P2P 网络,egui 复刻飞书界面。**ltl-manage 本体不改动。**
+
+## 认证(可配置)
+
+服务器 `config.toml [auth] mode` 四选一(模板见 `config.example.toml`,细节见 SKILL.md):
+
+- **ym** —— 兼容旧 YM Auth(手机号/token);
+- **casdoor** —— 自部署 [Casdoor](https://casdoor.ai) 单二进制 + SQLite,登录页自带 密码 / **邮箱验证码** / 短信 / **飞书扫码**;chat-server 只调 OIDC userinfo,GUI"打开浏览器登录"后轮询取票;
+- **local** —— 内置账号(用户名 + argon2,`ltl-chat-server hash` 生成),断网内网可用;
+- **token** —— 静态令牌白名单。
+
+四态最终都发本服务自己的 JWT;`demo = false` 关闭演示后门。登录方式以后要换(微信扫码、PASSKEY…),只动 Casdoor 管理台,chat-server/GUI 不改。
 
 ```
 rs-ltlCallCraft/

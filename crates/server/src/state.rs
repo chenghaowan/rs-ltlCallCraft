@@ -1,34 +1,54 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
 
+use ltl_chat_core::api::TokenResponse;
+use ltl_chat_core::casdoor::CasdoorClient;
 use ltl_chat_core::error::Result;
 use ltl_chat_core::iroh::EndpointId;
 use ltl_chat_core::node::{server_key_file, ChatNode};
 use ltl_chat_core::types::{GossipEnvelope, GossipPayload};
 use ltl_chat_core::ym::YmAuthClient;
 
+use crate::config::{AuthMode, AuthSection, FileConfig};
 use crate::db::Db;
 use crate::jwt::JwtKeys;
 
 /// 在线判定窗口(旧系统 600s, 这里心跳 30s 收紧到 120s)
 pub const ONLINE_WINDOW_MS: i64 = 120_000;
 
+/// OAuth 轮询票据有效期
+pub const OAUTH_TICKET_TTL: Duration = Duration::from_secs(10 * 60);
+
 pub struct AppState {
     pub db: Db,
     pub node: ChatNode,
     pub endpoint_id: EndpointId,
-    pub ym: YmAuthClient,
+    pub auth: AuthSection,
+    /// 仅 mode = ym 时构建
+    pub ym: Option<YmAuthClient>,
+    /// 仅 mode = casdoor 时构建
+    pub casdoor: Option<CasdoorClient>,
     pub jwt: JwtKeys,
     pub uploads_dir: PathBuf,
     /// roster 同步节流(至少间隔 60s)
     pub last_sync: Mutex<Option<Instant>>,
+    /// OAuth 轮询票据: ticket → Pending{state} / Done{resp}
+    pub oauth: Mutex<HashMap<String, OAuthSlot>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum OAuthSlot {
+    Pending { state: String, at: Instant },
+    Done { resp: TokenResponse },
 }
 
 impl AppState {
-    pub async fn init(data_dir: &Path, ym_auth_base: &str) -> Result<Arc<Self>> {
+    pub async fn init(data_dir: &Path, cfg: &FileConfig) -> Result<Arc<Self>> {
+        let auth = cfg.auth.clone();
         std::fs::create_dir_all(data_dir)?;
         let uploads_dir = data_dir.join("uploads");
         std::fs::create_dir_all(&uploads_dir)?;
@@ -37,16 +57,33 @@ impl AppState {
         let node = ChatNode::spawn(&server_key_file(data_dir)).await?;
         let endpoint_id = node.endpoint_id();
         let jwt = JwtKeys::load_or_create(&data_dir.join("server_jwt.key"))?;
-        let ym = YmAuthClient::new(ym_auth_base);
+
+        let ym = if auth.mode == AuthMode::Ym {
+            Some(YmAuthClient::new(cfg.ym_endpoint()))
+        } else {
+            None
+        };
+        let casdoor = if auth.mode == AuthMode::Casdoor {
+            Some(CasdoorClient::new(
+                auth.casdoor.endpoint.as_deref().expect("casdoor endpoint 已校验"),
+                auth.casdoor.client_id.as_deref().expect("casdoor client_id 已校验"),
+                auth.casdoor.client_secret.as_deref().unwrap_or(""),
+            ))
+        } else {
+            None
+        };
 
         let st = Arc::new(Self {
             db,
             node,
             endpoint_id,
+            auth,
             ym,
+            casdoor,
             jwt,
             uploads_dir,
             last_sync: Mutex::new(None),
+            oauth: Mutex::new(HashMap::new()),
         });
 
         // 启动时对每个已存在会话 topic 建立持久化订阅

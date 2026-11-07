@@ -25,6 +25,8 @@ dirs.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 futures-lite.workspace = true
+argon2 = "0.5"
+toml.workspace = true
 
 [[bin]]
 name = "ltl-chat-server"

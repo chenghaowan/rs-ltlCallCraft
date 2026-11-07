@@ -18,18 +18,31 @@ cargo test -p ltl-chat-core
 ## 服务器
 
 ```bash
-cargo run -p ltl-chat-server -- --host 127.0.0.1 --port 8901 --data-dir data
+cargo run -p ltl-chat-server -- serve --host 127.0.0.1 --port 8901 --data-dir data [--config config.toml]
+# 生成内置账号哈希: ltl-chat-server hash 你的密码   → 粘贴进 config.toml [auth.users]
 # 环境变量 RUST_LOG=debug 可看 gossip 收包;数据在 data/{server.db,server_jwt.key,server_node.key,uploads/}
 ```
 
-- 登记登录对接 YM Auth(`--ym-auth-base https://yimei2000.cn/auth`,默认)。
-- **本地演示**:`demo_` 前缀 token 不走外网 —— `demo_local_dev`、`demo_user_a` 等任意后缀,每人一个独立演示账号。
-- 服务器是每个会话 gossip 主题的常驻节点(引导 + 历史留档 + 附件存储)。
+**认证四态**(`config.toml [auth] mode`,模板见 `config.example.toml`):
+
+| mode | 登录方式 | GUI 登录页 |
+|---|---|---|
+| `ym`(默认) | YM Auth 手机号 / token;缺省 endpoint = https://yimei2000.cn/auth | 手机号表单 + token 粘贴 |
+| `casdoor` | 浏览器打开 Casdoor 授权页(密码/邮箱验证码/短信/**飞书扫码**)+ token 兜底 | "打开浏览器登录" + 轮询,2s×150 次 |
+| `local` | config.toml 内置账号(用户名 + argon2) | 用户名密码表单 |
+| `token` | 静态令牌白名单 → 显示名 | token 粘贴 |
+
+- `demo = true`(缺省)时任何模式下 `demo_` 前缀 token 可直接登录(每人一个独立演示账号);生产置 false。
+- `GET /api/v1/auth/meta` 无需登录返回 `{mode, demo}`,GUI/CLI 启动即拉取。
+- **casdoor 模式流程**:`GET /auth/oauth-url` 返回授权页地址 + 票据 → 用户浏览器完成登录 → Casdoor 回调 `{proto}://{host}/api/v1/auth/callback`(Host 自动识别,反代需传 X-Forwarded-Proto/Host)→ 服务器用 client_secret 换 token + userinfo → 发自家 JWT → GUI 每 2s `GET /auth/poll?ticket=` 取走。
+- **Casdoor 部署清单**(阿里云,单二进制 + SQLite):① 二级域名如 `auth.yimei2000.cn` nginx 反代,透传 Host/X-Forwarded-Proto,acme 证书;② `conf/app.conf` 的 `origin` 必须等于对外域名,`driverName=sqlite3` 首次启动自动建表(默认管理员 admin/123);③ 管理台建 1 个 Application(client_id/secret + 回调白名单)和 Providers(Aliyun SMS / Email SMTP 走 465 端口 / Lark 飞书);④ 登录方式在应用上勾选;RBAC 完全不用管。
 
 ## CLI
 
 ```bash
 cargo run -p ltl-chat-cli -- login --token demo_alice
+cargo run -p ltl-chat-cli -- login --user alice --password xxx    # 服务器 local 模式
+cargo run -p ltl-chat-cli -- login --oauth                        # 服务器 casdoor 模式(开浏览器+轮询)
 cargo run -p ltl-chat-cli -- --profile bob login --token demo_bob
 cargo run -p ltl-chat-cli -- whoami | users | conversations
 cargo run -p ltl-chat-cli -- create-dm --user bob

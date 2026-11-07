@@ -1,0 +1,44 @@
+# ltl-chat-server 配置模板
+# 启动: ltl-chat-server serve --config config.toml --data-dir ./data
+# 不带 --config 时, 若 ./config.toml 存在则读取; 否则 = ym 模式 + demo 开(本地联调默认)
+
+[auth]
+# 登录模式四选一:
+#   ym      —— 对接旧 YM Auth(yimei2000.cn/auth), 手机号/token 登录(默认)
+#   casdoor —— 对接自部署 Casdoor(密码/邮箱验证码/短信/飞书扫码, 在浏览器完成登录)
+#   local   —— 内置账号([auth.users], argon2 哈希, 断网内网可用)
+#   token   —— 静态令牌白名单([auth.tokens])
+mode = "casdoor"
+# demo_* 前缀演示 token 开关(缺省 true, 生产建议 false)
+demo = false
+
+# ------------------------------------------------------------------
+# mode = casdoor 时必填
+# Casdoor 侧: 建 1 个 Application(client_id/secret) + Providers(Aliyun SMS / Email SMTP / Lark 飞书)
+# redirect_uri 会自动用本服务请求的 Host 生成:
+#   {proto}://{host}/api/v1/auth/callback   —— 把它加进 Casdoor 应用回调白名单
+# ------------------------------------------------------------------
+[auth.casdoor]
+endpoint      = "https://auth.yimei2000.cn"   # Casdoor 的 origin, 二级域名经 nginx 反代即可
+client_id     = "ltl-chat"
+client_secret = "这里填 Casdoor 应用密钥"
+
+# ------------------------------------------------------------------
+# mode = local:内置账号。哈希生成: ltl-chat-server hash 你的密码
+# ------------------------------------------------------------------
+[auth.users]
+alice = "$argon2id$v=19$m=19456,t=2,p=1$…"
+bob   = "$argon2id$v=19$m=19456,t=2,p=1$…"
+
+# ------------------------------------------------------------------
+# mode = token:静态令牌 → 显示名(token 不对外泄露, 其他用户看到的是派生 id)
+# ------------------------------------------------------------------
+[auth.tokens]
+"team-2026-secret" = "张三"
+"bob-pass-99"      = "李四"
+
+# ------------------------------------------------------------------
+# mode = ym:兼容旧 YM Auth(缺省 endpoint 即下值, 可省略)
+# ------------------------------------------------------------------
+[auth.ym]
+endpoint = "https://yimei2000.cn/auth"

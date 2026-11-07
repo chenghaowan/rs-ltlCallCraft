@@ -45,6 +45,28 @@ struct RefreshBody {
     access_token: String,
 }
 
+/// 服务器认证能力描述(/auth/meta, 无需登录)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuthMeta {
+    /// ym | casdoor | local | token
+    pub mode: String,
+    #[serde(default)]
+    pub demo: bool,
+}
+
+#[derive(Serialize)]
+struct LocalLoginBody {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OAuthStartResponse {
+    pub authorization_url: String,
+    pub ticket: String,
+    pub redirect_uri: String,
+}
+
 #[derive(Serialize)]
 pub struct CreateConversationBody {
     pub conv_type: ConvType,
@@ -120,6 +142,39 @@ impl ChatApiClient {
 
     pub async fn me(&self) -> Result<User> {
         self.get("/api/v1/auth/me").await
+    }
+
+    /// 服务器认证能力(无需登录;GUI 据此渲染登录表单)
+    pub async fn auth_meta(&self) -> Result<AuthMeta> {
+        self.get("/api/v1/auth/meta").await
+    }
+
+    /// 内置账号登录(服务器 [auth] mode = local)
+    pub async fn login_local(&self, username: &str, password: &str) -> Result<TokenResponse> {
+        self.post(
+            "/api/v1/auth/login/local",
+            &LocalLoginBody { username: username.into(), password: password.into() },
+        )
+        .await
+    }
+
+    /// 发起浏览器 OAuth 登录(casdoor 模式):返回授权页地址 + 轮询票据
+    pub async fn oauth_start(&self) -> Result<OAuthStartResponse> {
+        self.get("/api/v1/auth/oauth-url").await
+    }
+
+    /// 轮询 OAuth 结果:None = 用户还没在浏览器完成(202),Some = 已登录
+    pub async fn oauth_poll(&self, ticket: &str) -> Result<Option<TokenResponse>> {
+        let url = format!("{}{}", self.base, &format!("/api/v1/auth/poll?ticket={ticket}"));
+        let mut req = self.http.get(&url);
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::ACCEPTED {
+            return Ok(None);
+        }
+        Ok(Some(self.parse(resp).await?))
     }
 
     // -- 名单 ----------------------------------------------------------------
@@ -250,7 +305,17 @@ impl ChatApiClient {
     async fn parse<T: DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(LtlError::Auth("登录已过期".into()));
+            // 优先带出服务器的具体原因(如"用户名或密码错误"), 否则默认文案
+            let detail = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("detail")
+                        .and_then(|d| d.as_str().map(|s| s.to_string()))
+                })
+                .unwrap_or_else(|| "登录已过期".into());
+            return Err(LtlError::Auth(detail));
         }
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();

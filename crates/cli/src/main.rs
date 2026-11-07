@@ -42,7 +42,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmds {
-    /// 登录并保存会话(手机号或 YM token;demo_ 前缀为本地演示)
+    /// 登录并保存会话(按服务器模式:--user/--password | --phone | --token | --oauth)
     Login {
         #[arg(long)]
         phone: Option<String>,
@@ -50,6 +50,15 @@ enum Cmds {
         username: Option<String>,
         #[arg(long)]
         token: Option<String>,
+        /// 内置账号模式:用户名
+        #[arg(long)]
+        user: Option<String>,
+        /// 内置账号模式:密码
+        #[arg(long)]
+        password: Option<String>,
+        /// casdoor 模式:打开浏览器授权页并轮询结果
+        #[arg(long, default_value_t = false)]
+        oauth: bool,
     },
     /// 当前登录用户
     Whoami,
@@ -139,14 +148,44 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = load_config(&dir);
 
     match cli.cmd {
-        Cmds::Login { phone, username, token } => {
+        Cmds::Login { phone, username, token, user, password, oauth } => {
             let api = ChatApiClient::new(&cli.server);
-            let resp = if let Some(p) = phone {
-                api.login_by_phone(&p, username.as_deref()).await
+            let resp = if oauth {
+                // 浏览器授权 + 轮询(casdoor 模式)
+                let start = api.oauth_start().await.context("发起浏览器登录失败")?;
+                println!("请在浏览器中完成登录(支持 密码/邮箱验证码/短信/飞书扫码):");
+                println!("  {}", start.authorization_url);
+                open::that(&start.authorization_url).ok();
+                print!("等待登录结果");
+                let mut result: anyhow::Result<ltl_chat_core::api::TokenResponse> =
+                    Err(anyhow::anyhow!("超时"));
+                for _ in 0..150 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    print!(".");
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    match api.oauth_poll(&start.ticket).await {
+                        Ok(Some(r)) => {
+                            result = Ok(r);
+                            break;
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            result = Err(anyhow::anyhow!("{e}"));
+                            break;
+                        }
+                    }
+                }
+                println!();
+                result
+            } else if let (Some(u), Some(pw)) = (user.as_deref(), password.as_deref()) {
+                api.login_local(u, pw).await.map_err(anyhow::Error::from)
+            } else if let Some(p) = phone {
+                api.login_by_phone(&p, username.as_deref()).await.map_err(anyhow::Error::from)
             } else if let Some(t) = token {
-                api.login_by_token(&t).await
+                api.login_by_token(&t).await.map_err(anyhow::Error::from)
             } else {
-                bail!("需要 --phone 或 --token");
+                Err(anyhow::anyhow!("需要 --user/--password、--phone 或 --token"))
             }
             .context("登录失败")?;
             cfg.server = cli.server.clone();

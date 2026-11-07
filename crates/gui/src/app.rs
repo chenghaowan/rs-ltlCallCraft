@@ -35,8 +35,13 @@ pub struct LtlChatApp {
 
     // 登录页
     pub login_server: String,
+    /// 服务器认证能力 (mode, demo)
+    pub auth_meta: Option<(String, bool)>,
+    /// casdoor 浏览器登录等待中
+    pub oauth_waiting: bool,
     pub login_phone: String,
     pub login_username: String,
+    pub login_password: String,
     pub login_token: String,
     pub login_error: Option<String>,
     pub login_busy: bool,
@@ -81,15 +86,19 @@ impl LtlChatApp {
         let data_dir = ltl_chat_core::util::data_dir(profile);
         let store = Arc::new(ClientStore::open(&data_dir.join("client.db")).expect("打开本地库失败"));
         let (cmd, evt_rx) = spawn_backend(store.clone(), data_dir.clone());
+        let _ = cmd.send(Cmd::LoadAuthMeta { server: server_default.clone() });
         Self {
             cmd,
             evt_rx,
             store,
             data_dir,
             login_server: server_default.clone(),
-            server_default,
+            auth_meta: None,
+            oauth_waiting: false,
+            server_default: server_default.clone(),
             login_phone: String::new(),
             login_username: String::new(),
+            login_password: String::new(),
             login_token: String::new(),
             login_error: None,
             login_busy: false,
@@ -190,6 +199,7 @@ impl LtlChatApp {
                 Evt::LoginOk { user } => {
                     self.me = Some(user);
                     self.login_busy = false;
+                    self.oauth_waiting = false;
                     self.login_error = None;
                     self.active_conv = None;
                     self.messages.clear();
@@ -197,6 +207,7 @@ impl LtlChatApp {
                 }
                 Evt::LoginFailed(e) => {
                     self.login_busy = false;
+                    self.oauth_waiting = false;
                     self.login_error = Some(e);
                 }
                 Evt::LoggedOut(reason) => {
@@ -206,6 +217,14 @@ impl LtlChatApp {
                     self.convs.clear();
                     self.login_error = Some(reason);
                     self.login_busy = false;
+                    self.oauth_waiting = false;
+                    let _ = self.cmd.send(Cmd::LoadAuthMeta { server: self.login_server.trim().to_string() });
+                }
+                Evt::AuthMeta { mode, demo } => {
+                    self.auth_meta = Some((mode, demo));
+                }
+                Evt::OAuthWaiting => {
+                    self.oauth_waiting = true;
                 }
                 Evt::DataChanged => {
                     self.dirty = true;

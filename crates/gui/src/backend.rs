@@ -50,6 +50,12 @@ pub enum Cmd {
     SetPinned { conv_id: i64, pinned: bool },
     DownloadAttachment { url: String, save_path: PathBuf },
     FetchImageData { url: String },
+    /// 登录页加载服务器认证能力(/auth/meta)
+    LoadAuthMeta { server: String },
+    /// 内置账号登录(服务器 local 模式)
+    LoginLocal { server: String, username: String, password: String },
+    /// 浏览器 OAuth 登录(casdoor 模式):打开授权页并轮询
+    OAuthStart { server: String },
 }
 
 pub enum Evt {
@@ -63,6 +69,10 @@ pub enum Evt {
     /// 图片下载并解码完成
     ImageReady { url: String, width: u32, height: u32, rgba: Vec<u8> },
     FileSaved { path: PathBuf },
+    /// 服务器认证能力(mode, demo)
+    AuthMeta { mode: String, demo: bool },
+    /// 浏览器 OAuth:已打开授权页, 正在等待用户完成
+    OAuthWaiting,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +179,51 @@ impl Backend {
             }
             Cmd::DownloadAttachment { url, save_path } => self.download(url, save_path).await,
             Cmd::FetchImageData { url } => self.fetch_image(url).await,
+            Cmd::LoadAuthMeta { server } => {
+                let api = ChatApiClient::new(&server);
+                match api.auth_meta().await {
+                    Ok(m) => self.send(Evt::AuthMeta { mode: m.mode, demo: m.demo }),
+                    Err(e) => self.send(Evt::Error(format!("获取服务器认证信息失败: {e}"))),
+                }
+            }
+            Cmd::LoginLocal { server, username, password } => {
+                let api = ChatApiClient::new(&server);
+                match api.login_local(&username, &password).await {
+                    Err(e) => self.send(Evt::LoginFailed(format!("{e}"))),
+                    Ok(resp) => self.establish(&server, resp).await,
+                }
+            }
+            Cmd::OAuthStart { server } => {
+                let api = ChatApiClient::new(&server);
+                match api.oauth_start().await {
+                    Err(e) => self.send(Evt::LoginFailed(format!("发起浏览器登录失败: {e}"))),
+                    Ok(start) => {
+                        if let Err(e) = open::that(&start.authorization_url) {
+                            self.send(Evt::Error(format!(
+                                "打开浏览器失败({e}), 请手动访问: {}",
+                                start.authorization_url
+                            )));
+                        }
+                        self.send(Evt::OAuthWaiting);
+                        // 轮询 5 分钟, 每 2s 一次
+                        for _ in 0..150 {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            match api.oauth_poll(&start.ticket).await {
+                                Ok(Some(resp)) => {
+                                    self.establish(&server, resp).await;
+                                    return;
+                                }
+                                Ok(None) => continue,
+                                Err(_) => {
+                                    self.send(Evt::LoginFailed("浏览器登录未完成或已过期".into()));
+                                    return;
+                                }
+                            }
+                        }
+                        self.send(Evt::LoginFailed("浏览器登录超时(5 分钟)".into()));
+                    }
+                }
+            }
         }
     }
 
