@@ -1,0 +1,13 @@
+# 项目级 cargo 配置:国内镜像加速(仅本项目生效,不影响全局)——与 rs-aiprivaderCraft / pointtofix 一致
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+
+# 与 ltl-meetingrecordCraft 同一套环境约定(bindgen 需要 libclang)
+[env]
+LIBCLANG_PATH = "C:/Users/40120/AppData/Local/Programs/Python/Python313/Lib/site-packages/clang/native"

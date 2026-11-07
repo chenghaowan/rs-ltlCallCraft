@@ -1,0 +1,31 @@
+[package]
+name = "ltl-chat-server"
+version.workspace = true
+edition.workspace = true
+description = "ltl-chat 服务器:YM Auth 登记登录 + 常驻 iroh 节点(引导/历史留档)+ 附件存储"
+
+[dependencies]
+ltl-chat-core.workspace = true
+axum = { version = "0.8", features = ["multipart"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+rand.workspace = true
+chrono.workspace = true
+jsonwebtoken.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+futures-lite.workspace = true
+
+[[bin]]
+name = "ltl-chat-server"
+path = "src/main.rs"
