@@ -1,3 +1,6 @@
+// 发行版(插件场景)隐藏控制台;开发保留便于看 tracing
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! ltl-chat 桌面端入口(egui, 飞书风格)—— 本项目主入口。
 //!
 //! ```text
@@ -8,6 +11,7 @@
 mod app;
 mod assets;
 mod backend;
+mod supervisor;
 mod views;
 
 use clap::Parser;
@@ -36,6 +40,9 @@ fn main() -> eframe::Result<()> {
 
     let cli = Cli::parse();
     let server = cli.server.clone();
+
+    // 插件化: 回环 server 不可达时自动拉起同目录 ltl-chat-server.exe(即装即用)
+    supervisor::ensure_local_server(&server);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
