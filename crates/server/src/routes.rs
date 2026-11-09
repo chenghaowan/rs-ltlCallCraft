@@ -14,7 +14,10 @@ use serde_json::json;
 
 use ltl_chat_core::api::TokenResponse;
 use ltl_chat_core::iroh_gossip::proto::TopicId;
-use ltl_chat_core::types::{AttachmentMeta, ConvType, Conversation, User, UserId};
+use ltl_chat_core::types::{
+    AttachmentMeta, ConvType, Conversation, GossipEnvelope, GossipPayload, Message, MessageId, User,
+    UserId,
+};
 
 use crate::config::AuthMode;
 use crate::db::UserRow;
@@ -37,7 +40,7 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/heartbeat", post(heartbeat))
         .route("/api/v1/conversations", get(conv_list).post(conv_create))
         .route("/api/v1/conversations/{id}/members", post(conv_add_members))
-        .route("/api/v1/conversations/{id}/messages", get(msg_history))
+        .route("/api/v1/conversations/{id}/messages", get(msg_history).post(msg_send))
         .route("/api/v1/files/upload", post(file_upload))
         .route("/api/v1/files/{id}", get(file_download))
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -663,6 +666,58 @@ async fn msg_history(
     Ok(Json(
         rows.into_iter().map(|(seq, message)| HistoryMessage { message, server_seq: seq }).collect(),
     ))
+}
+
+#[derive(Deserialize)]
+struct SendMessageBody {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    attachments: Vec<AttachmentMeta>,
+    #[serde(default)]
+    reply_to: Option<MessageId>,
+}
+
+/// HTTP 发消息(ltl-manage 内嵌页面等无 iroh 客户端使用):
+/// 鉴权 → 成员校验 → 构造 Message → 经已订阅 topic 的 sender gossip 广播
+/// (在线 GUI 对端秒收;iroh 不回显, 服务器自身只落库一次)→ 落库取 server_seq。
+/// 广播失败不阻塞返回——对端还有 30s 增量 backfill 兜底。
+async fn msg_send(
+    State(st): State<Arc<AppState>>,
+    AxPath(id): AxPath<i64>,
+    headers: HeaderMap,
+    Json(body): Json<SendMessageBody>,
+) -> ApiResult<HistoryMessage> {
+    let me = current_user(&st, &headers)?;
+    if !st.db.is_member(id, me.id)? {
+        return Err(ApiError::not_found("会话不存在或非成员"));
+    }
+    let text = body.text.trim();
+    if text.is_empty() && body.attachments.is_empty() {
+        return Err(ApiError::bad_request("消息内容为空"));
+    }
+    let conv = st
+        .db
+        .conversation(id)?
+        .ok_or_else(|| ApiError::not_found("会话不存在"))?;
+    let message = Message {
+        reply_to: body.reply_to,
+        attachments: body.attachments,
+        ..Message::new_text(id, me.id, &me.name, text.to_string())
+    };
+    let envelope = GossipEnvelope::new(GossipPayload::Message(message.clone()));
+    let bytes = envelope.to_bytes();
+    // 先取克隆结束锁语句, 避免 MutexGuard 跨 .await (future 需 Send)
+    let sender = st.senders.lock().unwrap().get(&conv.topic_id).cloned();
+    if let Some(sender) = sender {
+        if let Err(e) = sender.broadcast(bytes.into()).await {
+            tracing::warn!("会话 {id} HTTP 消息 gossip 广播失败(对端将靠增量补齐): {e}");
+        }
+    } else {
+        tracing::warn!("会话 {id} topic sender 未就绪, 仅落库(对端将靠增量补齐)");
+    }
+    let server_seq = st.db.insert_message(&message)?;
+    Ok(Json(HistoryMessage { message, server_seq }))
 }
 
 // ---------------------------------------------------------------------------

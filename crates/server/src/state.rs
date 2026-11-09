@@ -9,6 +9,7 @@ use ltl_chat_core::api::TokenResponse;
 use ltl_chat_core::casdoor::CasdoorClient;
 use ltl_chat_core::error::Result;
 use ltl_chat_core::iroh::EndpointId;
+use ltl_chat_core::iroh_gossip::api::GossipSender;
 use ltl_chat_core::node::{server_key_file, ChatNode};
 use ltl_chat_core::types::{GossipEnvelope, GossipPayload};
 use ltl_chat_core::ym::YmAuthClient;
@@ -38,6 +39,8 @@ pub struct AppState {
     pub last_sync: Mutex<Option<Instant>>,
     /// OAuth 轮询票据: ticket → Pending{state} / Done{resp}
     pub oauth: Mutex<HashMap<String, OAuthSlot>>,
+    /// 已订阅 topic 的 gossip 发送端 (topic_hex → sender), 供 HTTP 发消息路由广播
+    pub senders: Mutex<HashMap<String, GossipSender>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +87,7 @@ impl AppState {
             uploads_dir,
             last_sync: Mutex::new(None),
             oauth: Mutex::new(HashMap::new()),
+            senders: Mutex::new(HashMap::new()),
         });
 
         // 启动时对每个已存在会话 topic 建立持久化订阅
@@ -100,12 +104,14 @@ impl AppState {
 }
 
 /// 常驻订阅循环:收 gossip → 落库(历史留档)。断流后 5s 重试。
+/// 同时登记 topic 的发送端 (st.senders), 供 HTTP 发消息路由广播。
 fn spawn_persist_loop(st: Arc<AppState>, topic_hex: String) {
     tokio::spawn(async move {
         loop {
             match st.node.join_topic(&topic_hex, None).await {
                 Ok(topic) => {
-                    let (_sender, mut receiver) = topic.split();
+                    let (sender, mut receiver) = topic.split();
+                    st.senders.lock().unwrap().insert(topic_hex.clone(), sender);
                     while let Some(item) = receiver.next().await {
                         match item {
                             Ok(ltl_chat_core::iroh_gossip::api::Event::Received(msg)) => {
@@ -118,6 +124,7 @@ fn spawn_persist_loop(st: Arc<AppState>, topic_hex: String) {
                             }
                         }
                     }
+                    st.senders.lock().unwrap().remove(&topic_hex);
                     tracing::warn!("topic {topic_hex} 事件流结束, 5s 后重新订阅");
                 }
                 Err(e) => {
