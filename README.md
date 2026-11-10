@@ -37,7 +37,7 @@ rs-ltlCallCraft/
 
 | mode | 登录方式 | 说明 |
 |---|---|---|
-| `ym`(默认) | YM Auth 手机号 / token | 兼容旧体系,缺省 endpoint `https://yimei2000.cn/auth` |
+| `ym`(默认) | YM Auth SSO(浏览器)/ token | 对接 yimei2000.cn Rauthy OIDC,缺省 endpoint `https://yimei2000.cn/auth` |
 | `casdoor` | 浏览器完成登录 | 自部署 [Casdoor](https://casdoor.ai)(单二进制 + SQLite):密码 / **邮箱验证码** / 短信 / **飞书扫码**,登录页自带;chat-server 只调 OIDC userinfo,GUI"打开浏览器登录"后自动轮询取票 |
 | `local` | 用户名 + 密码 | 内置账号(argon2,`ltl-chat-server hash` 生成哈希),断网内网可用 |
 | `token` | 静态令牌白名单 | `token → 显示名` 映射,最简部署 |

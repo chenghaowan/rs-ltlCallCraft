@@ -32,7 +32,6 @@ use ltl_chat_core::types::{
 #[allow(dead_code)] // TryResume 由 backend 启动时直接调用; RefreshUsers 备用
 pub enum Cmd {
     LoginByToken { server: String, token: String },
-    LoginByPhone { server: String, phone: String, username: Option<String> },
     TryResume { server: String },
     Logout,
     RefreshConversations,
@@ -54,7 +53,7 @@ pub enum Cmd {
     LoadAuthMeta { server: String },
     /// 内置账号登录(服务器 local 模式)
     LoginLocal { server: String, username: String, password: String },
-    /// 浏览器 OAuth 登录(casdoor 模式):打开授权页并轮询
+    /// 浏览器 OAuth/SSO 登录(ym / casdoor 模式):打开授权页并轮询
     OAuthStart { server: String },
 }
 
@@ -110,7 +109,6 @@ pub struct Backend {
 
 enum LoginKind {
     Token(String),
-    Phone { phone: String, username: Option<String> },
 }
 
 pub fn spawn_backend(
@@ -155,9 +153,6 @@ impl Backend {
         match cmd {
             Cmd::LoginByToken { server, token } => {
                 self.login(&server, LoginKind::Token(token)).await
-            }
-            Cmd::LoginByPhone { server, phone, username } => {
-                self.login(&server, LoginKind::Phone { phone, username }).await
             }
             Cmd::TryResume { server } => self.try_resume_at(&server).await,
             Cmd::Logout => self.logout("已退出登录"),
@@ -235,9 +230,6 @@ impl Backend {
         let api = ChatApiClient::new(server);
         let resp: Result<TokenResponse, ltl_chat_core::error::LtlError> = match kind {
             LoginKind::Token(t) => api.login_by_token(&t).await,
-            LoginKind::Phone { phone, username } => {
-                api.login_by_phone(&phone, username.as_deref()).await
-            }
         };
         match resp {
             Err(e) => self.send(Evt::LoginFailed(format!("{e}"))),

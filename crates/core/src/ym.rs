@@ -1,9 +1,10 @@
 //! YM Auth(yimei2000.cn)客户端 —— 服务器侧专用。
 //!
-//! 语义移植自 ltl-manage `backend/src/app/modules/auth/service.py`:
+//! ym_auth 已改造为 Rauthy OIDC SSO(本地不再有手机号登录):
+//! - `login_url`:      GET {base}/api/v1/auth/oidc/login?redirect_to=... → {authorization_url}
+//!                     (浏览器完成 Rauthy 登录后, ym_auth 中转页把 token 拼在 redirect_to 上带回)
 //! - `validate_token`: GET {base}/api/v1/auth/me, Bearer token
-//! - `phone_login`:   POST {base}/api/v1/auth/phone/login {phone, username?}
-//! - `users_list`:    GET {base}/api/v1/users/list, Bearer token
+//! - `users_list`:     GET {base}/api/v1/users/list, Bearer token
 //!
 //! `demo_` 前缀 token 的本地演示分支在 server 里实现, 不经过这里。
 
@@ -40,11 +41,9 @@ struct YmMeResponse {
 }
 
 #[derive(Deserialize)]
-struct YmPhoneLoginResponse {
+struct YmLoginUrlResponse {
     #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
+    authorization_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -111,33 +110,32 @@ impl YmAuthClient {
         })
     }
 
-    /// 手机号登录, 返回 (access_token, refresh_token);detail 为错误说明
-    pub async fn phone_login(&self, phone: &str, username: Option<&str>) -> Result<(String, Option<String>), String> {
-        let url = format!("{}/api/v1/auth/phone/login", self.base);
-        let mut body = serde_json::json!({ "phone": phone });
-        if let Some(u) = username {
-            body["username"] = serde_json::Value::String(u.to_string());
-        }
+    /// 发起 SSO 登录:请求 ym_auth 生成 Rauthy 授权地址。
+    ///
+    /// `redirect_to` 是用户在浏览器完成登录后的最终落地页;ym_auth 中转页会把
+    /// `access_token` / `refresh_token`(或 `error` / `detail`)拼在它的 `?` 后面带回。
+    pub async fn login_url(&self, redirect_to: &str) -> Result<String, String> {
+        let url = format!(
+            "{}/api/v1/auth/oidc/login?redirect_to={}",
+            self.base,
+            urlencode(redirect_to)
+        );
         let resp = self
             .http
-            .post(&url)
-            .json(&body)
+            .get(&url)
             .send()
             .await
             .map_err(|e| format!("YM Auth 不可达: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
-            let detail = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("detail").and_then(|d| d.as_str().map(|s| s.to_string())))
-                .unwrap_or_else(|| "手机号登录失败".into());
-            return Err(detail);
+            return Err(format!("YM Auth 登录接口失败: HTTP {status}"));
         }
-        let data: YmPhoneLoginResponse = resp.json().await.map_err(|e| format!("YM Auth 返回异常: {e}"))?;
-        let access = data.access_token.ok_or("YM Auth 返回缺少 access_token")?;
-        Ok((access, data.refresh_token))
+        let data: YmLoginUrlResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("YM Auth 返回异常: {e}"))?;
+        data.authorization_url
+            .ok_or("YM Auth 返回缺少 authorization_url".to_string())
     }
 
     /// 拉全员名单(用于登记/同步本地用户表);失败返回空
@@ -163,4 +161,18 @@ impl YmAuthClient {
             })
             .collect()
     }
+}
+
+/// 极简 percent-encode(查询串值用, 不引额外依赖)
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }

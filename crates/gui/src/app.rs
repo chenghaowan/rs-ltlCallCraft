@@ -37,9 +37,8 @@ pub struct LtlChatApp {
     pub login_server: String,
     /// 服务器认证能力 (mode, demo)
     pub auth_meta: Option<(String, bool)>,
-    /// casdoor 浏览器登录等待中
+    /// 浏览器 OAuth/SSO 登录等待中(ym / casdoor 模式)
     pub oauth_waiting: bool,
-    pub login_phone: String,
     pub login_username: String,
     pub login_password: String,
     pub login_token: String,
@@ -96,7 +95,6 @@ impl LtlChatApp {
             auth_meta: None,
             oauth_waiting: false,
             server_default: server_default.clone(),
-            login_phone: String::new(),
             login_username: String::new(),
             login_password: String::new(),
             login_token: String::new(),

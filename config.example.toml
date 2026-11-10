@@ -4,7 +4,7 @@
 
 [auth]
 # 登录模式四选一:
-#   ym      —— 对接旧 YM Auth(yimei2000.cn/auth), 手机号/token 登录(默认)
+#   ym      —— 对接 YM Auth SSO(yimei2000.cn/auth), 浏览器登录/token 登录(默认)
 #   casdoor —— 对接自部署 Casdoor(密码/邮箱验证码/短信/飞书扫码, 在浏览器完成登录)
 #   local   —— 内置账号([auth.users], argon2 哈希, 断网内网可用)
 #   token   —— 静态令牌白名单([auth.tokens])

@@ -34,13 +34,6 @@ struct LoginByTokenBody {
 }
 
 #[derive(Serialize)]
-struct LoginByPhoneBody {
-    phone: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-}
-
-#[derive(Serialize)]
 struct RefreshBody {
     access_token: String,
 }
@@ -126,14 +119,6 @@ impl ChatApiClient {
             .await
     }
 
-    pub async fn login_by_phone(&self, phone: &str, username: Option<&str>) -> Result<TokenResponse> {
-        self.post(
-            "/api/v1/auth/phone/login",
-            &LoginByPhoneBody { phone: phone.into(), username: username.map(|s| s.to_string()) },
-        )
-        .await
-    }
-
     /// 旧 token 续签(签发 30 天内有效)
     pub async fn refresh(&self, old_token: &str) -> Result<TokenResponse> {
         self.post("/api/v1/auth/refresh", &RefreshBody { access_token: old_token.into() })
@@ -158,7 +143,7 @@ impl ChatApiClient {
         .await
     }
 
-    /// 发起浏览器 OAuth 登录(casdoor 模式):返回授权页地址 + 轮询票据
+    /// 发起浏览器 OAuth/SSO 登录(casdoor 或 ym 模式):返回授权页地址 + 轮询票据
     pub async fn oauth_start(&self) -> Result<OAuthStartResponse> {
         self.get("/api/v1/auth/oauth-url").await
     }

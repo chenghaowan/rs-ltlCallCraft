@@ -1,7 +1,7 @@
 //! ltl-chat 命令行。
 //!
 //! ```text
-//! ltl-chat-cli login --phone 13800000000 --username 张三
+//! ltl-chat-cli login --oauth        # ym/casdoor 模式: 浏览器 SSO 登录
 //! ltl-chat-cli login --token demo_local_dev
 //! ltl-chat-cli users / conversations / whoami
 //! ltl-chat-cli create-dm --user 张三
@@ -42,12 +42,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmds {
-    /// 登录并保存会话(按服务器模式:--user/--password | --phone | --token | --oauth)
+    /// 登录并保存会话(按服务器模式:--user/--password | --token | --oauth)
     Login {
-        #[arg(long)]
-        phone: Option<String>,
-        #[arg(long)]
-        username: Option<String>,
         #[arg(long)]
         token: Option<String>,
         /// 内置账号模式:用户名
@@ -56,7 +52,7 @@ enum Cmds {
         /// 内置账号模式:密码
         #[arg(long)]
         password: Option<String>,
-        /// casdoor 模式:打开浏览器授权页并轮询结果
+        /// ym / casdoor 模式:打开浏览器授权页并轮询结果
         #[arg(long, default_value_t = false)]
         oauth: bool,
     },
@@ -148,12 +144,12 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = load_config(&dir);
 
     match cli.cmd {
-        Cmds::Login { phone, username, token, user, password, oauth } => {
+        Cmds::Login { token, user, password, oauth } => {
             let api = ChatApiClient::new(&cli.server);
             let resp = if oauth {
-                // 浏览器授权 + 轮询(casdoor 模式)
+                // 浏览器授权 + 轮询(ym / casdoor 模式)
                 let start = api.oauth_start().await.context("发起浏览器登录失败")?;
-                println!("请在浏览器中完成登录(支持 密码/邮箱验证码/短信/飞书扫码):");
+                println!("请在浏览器中完成登录:");
                 println!("  {}", start.authorization_url);
                 open::that(&start.authorization_url).ok();
                 print!("等待登录结果");
@@ -180,12 +176,10 @@ async fn main() -> anyhow::Result<()> {
                 result
             } else if let (Some(u), Some(pw)) = (user.as_deref(), password.as_deref()) {
                 api.login_local(u, pw).await.map_err(anyhow::Error::from)
-            } else if let Some(p) = phone {
-                api.login_by_phone(&p, username.as_deref()).await.map_err(anyhow::Error::from)
             } else if let Some(t) = token {
                 api.login_by_token(&t).await.map_err(anyhow::Error::from)
             } else {
-                Err(anyhow::anyhow!("需要 --user/--password、--phone 或 --token"))
+                Err(anyhow::anyhow!("需要 --user/--password、--token 或 --oauth"))
             }
             .context("登录失败")?;
             cfg.server = cli.server.clone();

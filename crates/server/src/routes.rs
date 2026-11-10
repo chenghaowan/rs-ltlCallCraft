@@ -29,9 +29,9 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/api/v1/auth/meta", get(auth_meta))
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/login/local", post(auth_login_local))
-        .route("/api/v1/auth/phone/login", post(auth_phone_login))
         .route("/api/v1/auth/oauth-url", get(auth_oauth_url))
         .route("/api/v1/auth/callback", get(auth_oauth_callback))
+        .route("/api/v1/auth/callback/ym/{ticket}", get(auth_ym_callback))
         .route("/api/v1/auth/poll", get(auth_oauth_poll))
         .route("/api/v1/auth/me", get(auth_me))
         .route("/api/v1/auth/refresh", post(auth_refresh))
@@ -125,9 +125,11 @@ fn current_user(st: &AppState, headers: &HeaderMap) -> Result<UserRow, ApiError>
 
 /// 服务器认证能力(无需登录;GUI/CLI 据此渲染登录表单)
 async fn auth_meta(State(st): State<Arc<AppState>>) -> ApiResult<serde_json::Value> {
+    let oauth = matches!(st.auth.mode, AuthMode::Casdoor | AuthMode::Ym);
     Ok(Json(serde_json::json!({
         "mode": st.auth.mode.as_str(),
         "demo": st.auth.demo_enabled(),
+        "oauth": oauth,
     })))
 }
 
@@ -273,7 +275,7 @@ async fn auth_login_local(
 }
 
 // ---------------------------------------------------------------------------
-// OAuth 浏览器登录(casdoor 模式):授权页 → 回调换码 → 票据轮询
+// OAuth 浏览器登录(casdoor / ym 模式):授权页 → 回调换码 → 票据轮询
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -290,26 +292,49 @@ async fn auth_oauth_url(
     Query(q): Query<OAuthUrlQuery>,
     uri: axum::extract::OriginalUri,
 ) -> ApiResult<ltl_chat_core::api::OAuthStartResponse> {
-    if st.auth.mode != AuthMode::Casdoor {
-        return Err(ApiError::bad_request("本服务器未启用 casdoor 模式"));
-    }
-    let (proto, host) = request_proto_host(&headers, uri);
-    let redirect_uri = match q.base {
-        Some(b) => format!("{}/api/v1/auth/callback", b.trim_end_matches('/')),
-        None => ltl_chat_core::casdoor::CasdoorClient::callback_uri(&proto, &host),
-    };
     let ticket = uuid::Uuid::new_v4().simple().to_string();
-    let casdoor = st.casdoor.as_ref().expect("casdoor client");
-    let authorization_url = casdoor.authorize_url(&redirect_uri, &ticket);
-    st.oauth.lock().unwrap().insert(
-        ticket.clone(),
-        OAuthSlot::Pending { state: ticket.clone(), at: Instant::now() },
-    );
-    Ok(Json(ltl_chat_core::api::OAuthStartResponse {
-        authorization_url,
-        ticket,
-        redirect_uri,
-    }))
+    let (proto, host) = request_proto_host(&headers, uri);
+    let public_base = match q.base {
+        Some(b) => b.trim_end_matches('/').to_string(),
+        None => format!("{proto}://{host}"),
+    };
+    match st.auth.mode {
+        AuthMode::Casdoor => {
+            let redirect_uri = format!("{public_base}/api/v1/auth/callback");
+            let casdoor = st.casdoor.as_ref().expect("casdoor client");
+            let authorization_url = casdoor.authorize_url(&redirect_uri, &ticket);
+            st.oauth.lock().unwrap().insert(
+                ticket.clone(),
+                OAuthSlot::Pending { state: ticket.clone(), at: Instant::now() },
+            );
+            Ok(Json(ltl_chat_core::api::OAuthStartResponse {
+                authorization_url,
+                ticket,
+                redirect_uri,
+            }))
+        }
+        AuthMode::Ym => {
+            // ym_auth(SSO)登录:回调走 ym_auth 中转页, 由它把 token 拼在落地页上带回
+            let redirect_uri = format!("{public_base}/api/v1/auth/callback/ym/{ticket}");
+            let authorization_url = st
+                .ym
+                .as_ref()
+                .expect("ym client")
+                .login_url(&redirect_uri)
+                .await
+                .map_err(ApiError::bad_request)?;
+            st.oauth.lock().unwrap().insert(
+                ticket.clone(),
+                OAuthSlot::Pending { state: ticket.clone(), at: Instant::now() },
+            );
+            Ok(Json(ltl_chat_core::api::OAuthStartResponse {
+                authorization_url,
+                ticket,
+                redirect_uri,
+            }))
+        }
+        _ => Err(ApiError::bad_request("本服务器未启用浏览器登录模式")),
+    }
 }
 
 fn request_proto_host(headers: &HeaderMap, uri: axum::extract::OriginalUri) -> (String, String) {
@@ -406,34 +431,54 @@ async fn auth_oauth_poll(
     }
 }
 
-#[derive(Deserialize)]
-struct PhoneLoginBody {
-    phone: String,
-    #[serde(default)]
-    username: Option<String>,
-}
-
-async fn auth_phone_login(
+/// ym_auth(SSO)回调落地页:ym_auth 中转页把 token 拼在本路由上带回。
+/// 校验 token → 签自家 JWT → 填票据槽, GUI/CLI 轮询 /poll 取结果。
+async fn auth_ym_callback(
     State(st): State<Arc<AppState>>,
-    Json(body): Json<PhoneLoginBody>,
-) -> ApiResult<TokenResponse> {
-    if st.auth.mode != AuthMode::Ym {
-        return Err(ApiError::bad_request("本服务器未启用 YM Auth 手机号登录"));
+    AxPath(ticket): AxPath<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Html<String>, ApiError> {
+    let err = |msg: &str| {
+        axum::response::Html(format!(
+            "<!DOCTYPE html><meta charset='utf-8'><body style=\"font-family:sans-serif;text-align:center;padding-top:15vh\"><h2>❌ 登录失败</h2><p style='color:#888'>{msg}</p></body>"
+        ))
+    };
+    // 取出票据(防重放: 取走即删)
+    let slot = st.oauth.lock().unwrap().remove(&ticket);
+    let Some(OAuthSlot::Pending { at, .. }) = slot else {
+        return Ok(err("登录票据无效或已使用, 请回应用重新发起"));
+    };
+    if at.elapsed() > crate::state::OAUTH_TICKET_TTL {
+        return Ok(err("登录票据已过期, 请回应用重新发起"));
     }
-    let (ym_access, ym_refresh) = st
+
+    if let Some(e) = q.get("error") {
+        let detail = q.get("detail").map(|d| format!(": {d}")).unwrap_or_default();
+        return Ok(err(&format!("{e}{detail}")));
+    }
+    let Some(ym_access) = q.get("access_token").cloned() else {
+        return Ok(err("回调缺少 access_token"));
+    };
+    let ym_refresh = q.get("refresh_token").cloned();
+
+    let info = st
         .ym
         .as_ref()
         .expect("ym client")
-        .phone_login(&body.phone, body.username.as_deref())
+        .validate_token(&ym_access)
         .await
-        .map_err(ApiError::unauthorized)?;
-    let Some(info) = st.ym.as_ref().expect("ym client").validate_token(&ym_access).await else {
-        return Err(ApiError::unauthorized("YM Auth 校验失败"));
-    };
-    let resp =
-        issue_token(&st, info, Some(&ym_access), ym_refresh.as_deref()).await?;
+        .ok_or_else(|| ApiError::unauthorized("YM Auth 校验失败"))?;
+    let resp = issue_token(&st, info, Some(&ym_access), ym_refresh.as_deref()).await?;
     spawn_roster_sync(&st);
-    Ok(Json(resp))
+
+    st.oauth
+        .lock()
+        .unwrap()
+        .insert(ticket, OAuthSlot::Done { resp });
+    tracing::info!("YM SSO 登录成功, 票据就绪");
+    Ok(axum::response::Html(
+        "<!DOCTYPE html><meta charset='utf-8'><body style=\"font-family:sans-serif;text-align:center;padding-top:15vh\"><h2>✅ 登录成功</h2><p style='color:#888'>请回到 ltl-chat 应用</p></body>".into(),
+    ))
 }
 
 async fn auth_me(State(st): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<User> {
